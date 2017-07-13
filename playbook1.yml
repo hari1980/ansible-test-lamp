@@ -1,23 +1,8 @@
 ---
 - hosts: appserver
   sudo: yes
-  vars:
-    user_name: Harish
-    cmd: ls -ltr
+  
   tasks:
-    - name: List all files in Root Directory
-      shell: "{{ cmd }}"
-    
-    - name: Install ngnix
-      apt: 
-        name: nginx
-        state: present
-
-    - name: "Copy index.html file from Local to AWS Machine for {{ user_name }}"
-      template:
-        src: index.html.j2
-        dest: /var/www/html/index.html
-
     - name: Install MySQL database
       apt: package= "{{ item }}" state=installed update_cache=yes force=yes cache_valid_time=3600 
       with_items:
@@ -27,7 +12,7 @@
         build-essential
         
     - name: write my.cnf 
-      action: template src='mysql/templates/my.cnf.j2' dest='/root/.my.cnf'
+      action: template src='templates/mysql/my.cnf.j2' dest='/root/.my.cnf'
     #  notify:
     #   - restart mysql 
 

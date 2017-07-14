@@ -1,0 +1,298 @@
+---
+- hosts: all
+  gather_facts: False
+
+  vars:
+    # db
+    mysql_root_username: "root"
+    mysql_root_password: "p24HOXBdY9qfZg"
+    # server
+    apache_listen_port: 80
+    apache_listen_port_ssl: 443
+    servername: "local.dev"
+    documentroot: "/var/www/html"
+    apache_vhosts_filename: "vhosts.conf"
+    # composer
+    composer_path: /usr/local/bin/composer
+    composer_home_path: '~/.composer'
+    composer_home_owner: root
+    composer_home_group: root
+    # drush
+    drush_install_path: /usr/local/share/drush
+    drush_path: /usr/local/bin/drush
+    drush_version: 8.1.0
+    # drupal
+    drupal_install_profile: "standard"
+    drupal_site_name: "Drupal 7"
+    drupal_account_name: "admin"
+    drupal_account_pass: "admin"
+    drupal_db_name: "mydb"
+    drupal_db_user: "foo"
+    drupal_db_password: "w8M3slK*QvqLnz@@"
+    # MySQL databases and users.
+    mysql_databases:
+      - name: "{{ drupal_db_name }}"
+        encoding: utf8mb4
+        collation: utf8mb4_general_ci
+
+    mysql_users:
+      - name: "{{ drupal_db_user }}"
+        host: "%"
+        password: "{{ drupal_db_password }}"
+        priv: "{{ drupal_db_name }}.*:ALL"
+
+  handlers:
+    - name: restart apache
+      service:
+        name: apache2
+        state: restarted
+
+  tasks:
+    - name: Meta | Install python 2
+      raw: test -e /usr/bin/python || (apt -y update && apt install -y python-minimal)
+      
+    - name: Meta | Update apt cache if needed.
+      apt: update_cache=yes cache_valid_time=86400
+
+      # PHP 7 stuff
+    - name: PHP | Add php-7.0 PPA
+      apt_repository: repo='ppa:ondrej/php'
+                  state=present
+                  update_cache=yes
+
+    - name: PHP | install php packages
+      apt: pkg={{ item }} state=installed
+      with_items:
+        - php7.0-fpm
+        - php7.0-cli
+        - php7.0-common
+        - php7.0-curl
+        - php7.0-json
+        - php7.0-gd
+        - php7.0-mcrypt
+        - php7.0-odbc
+        - php7.0-mbstring
+        - php7.0-mysql
+        - php7.0-xmlrpc
+        - php7.0-opcache
+        - php7.0-intl
+        - php7.0-bz2
+        - php7.0-xml
+
+    - name: MySQL | Install MySQL
+      apt: pkg={{ item }} state=installed
+      with_items:
+        - mysql-common
+        - mysql-server
+        - python-mysqldb
+
+    - name: MySQL | Get MySQL version.
+      command: 'mysql --version'
+      register: mysql_cli_version
+      changed_when: false
+
+    - name: MySQL | Disallow root login remotely
+      command: 'mysql -NBe "{{ item }}"'
+      with_items:
+        - DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1')
+      changed_when: false
+
+    - name: MySQL | Get list of hosts for the root user.
+      command: mysql -NBe 'SELECT Host FROM mysql.user WHERE User = "root" ORDER BY (Host="localhost") ASC'
+      register: mysql_root_hosts
+      changed_when: false
+      check_mode: no
+
+    - name: MySQL | Update MySQL root password for localhost root account.
+      shell: >
+        mysql -u root -NBe
+        'ALTER USER "{{ mysql_root_username }}"@"{{ item }}" IDENTIFIED WITH mysql_native_password BY "{{ mysql_root_password }}";'
+      with_items: "{{ mysql_root_hosts.stdout_lines|default([]) }}"
+
+        
+    # Has to be after the root password assignment, for idempotency.
+    - name: MySQL | Copy .my.cnf file with root password credentials.
+      template:
+        src: "./templates/user-my.cnf.j2"
+        dest: "/root/.my.cnf"
+        owner: root
+        group: root
+        mode: 0600
+
+    - name: MySQL | Ensure MySQL users are present.
+      mysql_user:
+        name: "{{ item.name }}"
+        host: "{{ item.host | default('localhost') }}"
+        password: "{{ item.password }}"
+        priv: "{{ item.priv | default('*.*:USAGE') }}"
+        state: "{{ item.state | default('present') }}"
+        append_privs: "{{ item.append_privs | default('no') }}"
+      with_items: "{{ mysql_users }}"
+      no_log: true
+
+    - name: MySQL | Ensure MySQL databases are present.
+      mysql_db:
+        name: "{{ item.name }}"
+        collation: "{{ item.collation | default('utf8_general_ci') }}"
+        encoding: "{{ item.encoding | default('utf8') }}"
+        state: present
+      with_items: "{{ mysql_databases }}"
+
+    - name: Apache | Install Apache
+      apt: pkg={{ item }} state=installed
+      with_items:
+        - apache2
+        - apache2-utils
+        - libapache2-mod-fastcgi
+        
+    - name: Apache | Ensure Apache is installed
+      apt: "name={{ item }} state=installed"
+      with_items:
+        - apache2
+        - apache2-utils
+        
+    - name: Apache | Enable some required modules
+      command: a2enmod actions fastcgi alias rewrite proxy proxy_fcgi
+      
+    - name: Apache | Add apache vhosts configuration.
+      template:
+        src: "./templates/vhosts.conf.j2"
+        dest: "/etc/apache2/sites-available/{{ apache_vhosts_filename }}"
+        owner: root
+        group: root
+        mode: 0644
+      notify: restart apache
+
+    - name: Apache | Add vhost symlink in sites-enabled.
+      file:
+        src: "/etc/apache2/sites-available/{{ apache_vhosts_filename }}"
+        dest: "/etc/apache2/sites-enabled/{{ apache_vhosts_filename }}"
+        state: link
+      notify: restart apache
+      
+    # Composer
+    - name: Composer | Set php_executable variable to a default if not defined.
+      set_fact:
+        php_executable: php
+        when: php_executable is not defined
+
+    - name: Composer | Check if Composer is installed.
+      stat: "path={{ composer_path }}"
+      register: composer_bin
+
+    - name: Composer | Download Composer installer.
+      get_url:
+        url: https://getcomposer.org/installer
+        dest: /tmp/composer-installer.php
+        mode: 0755
+      when: not composer_bin.stat.exists
+
+    - name: Composer | Run Composer installer.
+      command: >
+        {{ php_executable }} composer-installer.php
+        chdir=/tmp
+      when: not composer_bin.stat.exists
+
+    - name: Composer | Move Composer into globally-accessible location.
+      shell: >
+        mv /tmp/composer.phar {{ composer_path }}
+        creates={{ composer_path }}
+      when: not composer_bin.stat.exists
+
+    - name: Composer | Update Composer to latest version (if configured).
+      shell: >
+        {{ php_executable }} {{ composer_path }} self-update
+      register: composer_update
+      changed_when: "'Updating to version' in composer_update.stdout"
+
+    - name: Composer | Ensure composer directory exists.
+      file:
+        path: "{{ composer_home_path }}"
+        owner: "{{ composer_home_owner }}"
+        group: "{{ composer_home_group }}"
+        state: directory
+
+    # Drush
+    - name: Prepare install path
+      file:
+        path: "{{ drush_install_path }}"
+        state: directory
+      become: true
+  
+    - name: Drush | Check if requested Drush package file exists for download
+      # Returns HTTP status code (string) of dynamically created file path
+      command: curl -s -o /dev/null -w "%{http_code}" https://github.com/drush-ops/drush/releases/download/{{ drush_version }}/drush.phar
+      register: drush_phar_http_code
+      changed_when: false
+
+    - name: Drush | Download packaged Drush release
+      get_url:
+        url: https://github.com/drush-ops/drush/releases/download/{{ drush_version }}/drush.phar
+        dest: "{{ drush_install_path }}/drush"
+        mode: "a+x"
+      register: phar_download
+      when: drush_phar_http_code.stdout == "302"
+
+    - name: Drush | Create Drush symlink
+      file:
+        src: "{{ drush_install_path }}/drush"
+        dest: "{{ drush_path }}"
+        state: link
+      when: >
+        not phar_download.skipped|default(false)
+        and drush_phar_http_code.stdout == "302"
+    #Drupal
+    - name: Drupal | Download Drupal
+      get_url: 
+        url: https://ftp.drupal.org/files/projects/drupal-7.52.tar.gz
+        dest: /tmp/drupal.tar.gz
+
+    - name: Drupal | Setup Drupal in docroot
+      unarchive:
+        src: /tmp/drupal.tar.gz
+        dest: "{{ documentroot }}"
+        copy: no
+        extra_opts: "--strip-components=1"
+
+    - name: Drupal | Check if site is already installed.
+      command: >
+        {{ drush_path }} status bootstrap
+        chdir={{ documentroot }}
+      register: drupal_site_installed
+      failed_when: "drupal_site_installed.stdout is undefined"
+      changed_when: false
+
+    # - name: Drupal | Create settings.php
+    #   command: cp "{{ documentroot }}/sites/default/default.settings.php" "{{ documentroot }}/sites/default/settings.php"
+    #   when: "'Successful' not in drupal_site_installed.stdout"
+
+    # - name: Drupal | Update permissions of settings.php
+    #   file: path="{{ documentroot }}/sites/default/settings.php" mode=777
+    #   when: "'Successful' not in drupal_site_installed.stdout"
+      
+    # - name: Drupal | Create files directory
+    #   file: path="{{ documentroot }}/sites/default/files" state=directory mode=777 recurse=yes
+    #   when: "'Successful' not in drupal_site_installed.stdout"
+  
+    - name: Drupal | Install Drupal with drush.
+      command: >
+        {{ drush_path }} site-install {{ drupal_install_profile | default('standard') }} -y
+        --site-name="{{ drupal_site_name }}"
+        --account-name={{ drupal_account_name }}
+        --account-pass={{ drupal_account_pass }}
+        --db-url=mysql://{{ drupal_db_user }}:{{ drupal_db_password }}@localhost/{{ drupal_db_name }}
+        {{ drupal_site_install_extra_args | default([]) | join(" ") }} --root={{ documentroot }}
+      notify: restart apache
+      when: "'Successful' not in drupal_site_installed.stdout"
+        
+    # Lets Encrypt
+
+    # Varnish
+
+    # Firewall
+
+    # Setup cron
+
+    # Setup backup/restore
+
+    # Check for periodic updates

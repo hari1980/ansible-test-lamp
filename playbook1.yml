@@ -1,18 +1,23 @@
 ---
 - hosts: appserver
   sudo: yes
+  vars:
+    mysql_root_password: "mysql123"
   
   tasks:
     - name: Install MySQL database
-      apt: package= "{{ item }}" state=installed update_cache=yes force=yes cache_valid_time=3600 
+      apt: pkg={{ item }} state=installed update_cache=yes force=yes cache_valid_time=3600 
       with_items:
-        python-mysqldb
-        mysql-server
-        mysql-client
-        build-essential
+        - python3-mysqldb
+        - mysql-server
+        - mysql-client
+        - mysql-common
+        - build-essential
         
     - name: write my.cnf 
-      action: template src='templates/mysql/my.cnf.j2' dest='/root/.my.cnf'
+      template:
+        src: templates/mysql/my.cnf.j2
+        dest: /root/.my.cnf
     #  notify:
     #   - restart mysql 
 
